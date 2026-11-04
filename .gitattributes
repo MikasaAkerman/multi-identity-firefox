@@ -1,0 +1,6 @@
+# The repo is shared between macOS and Windows; keep each script family in the
+# line endings its interpreter expects regardless of checkout platform.
+*.cmd text eol=crlf
+*.sh  text eol=lf
+bin/mif text eol=lf
+*.py  text eol=lf

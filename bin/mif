@@ -1,0 +1,6 @@
+#!/bin/bash
+# Entry point on macOS and Linux. All logic lives in the mif Python package.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+exec python3 -m mif "$@"
