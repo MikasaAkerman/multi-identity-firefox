@@ -21,6 +21,8 @@ NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 PROXY_TYPES = ("none", "http", "socks5")
+# Kept here, not in mif.browsers, so loading a conf does not import backends.
+BROWSER_KEYS = ("firefox", "chrome", "edge", "brave", "chromium")
 
 
 class MifError(Exception):
@@ -62,6 +64,7 @@ class Identity:
     """One identity, named after its conf file."""
 
     name: str
+    browser: str = "firefox"
     language: str = "en-US"
     locale: str = "en-US"
     timezone: str = "UTC"
@@ -79,7 +82,11 @@ class Identity:
 
     @property
     def profile_dir(self) -> Path:
-        return DATA_DIR / self.name / "profile"
+        # Firefox keeps the original directory so existing profiles stay put.
+        # Other browsers get their own user-data-dir beside it.
+        if self.browser == "firefox":
+            return DATA_DIR / self.name / "profile"
+        return DATA_DIR / self.name / f"profile-{self.browser}"
 
     @property
     def download_dir(self) -> Path:
@@ -94,6 +101,11 @@ class Identity:
         self.download_dir.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> None:
+        if self.browser not in BROWSER_KEYS:
+            raise MifError(
+                f"{self.name}: unsupported BROWSER={self.browser!r} "
+                f"(expected one of {', '.join(BROWSER_KEYS)})"
+            )
         if self.proxy_type not in PROXY_TYPES:
             raise MifError(
                 f"{self.name}: unsupported PROXY_TYPE={self.proxy_type!r} "
@@ -133,8 +145,10 @@ def load_identity(name: str) -> Identity:
     if not conf.is_file():
         raise MifError(f"Identity not found: {name}")
     values = _parse_conf(conf)
+    browser = values.get("BROWSER", "firefox").strip().lower() or "firefox"
     identity = Identity(
         name=name,
+        browser=browser,
         language=values.get("LANGUAGE", "en-US"),
         locale=values.get("LOCALE", "en-US"),
         timezone=values.get("TIMEZONE", "UTC"),

@@ -8,9 +8,12 @@ import shutil
 import subprocess
 import sys
 
-from . import launchers, prefs, tz
+from . import launchers, tz
+from .binpath import is_windows, wants_arm64_launch
+from .browsers import get as get_browser
 from .config import (
     APPS_DIR,
+    BROWSER_KEYS,
     DATA_DIR,
     IDENTITIES_DIR,
     Identity,
@@ -19,9 +22,9 @@ from .config import (
     load_identity,
     validate_name,
 )
-from .ffpath import firefox_binary, is_windows, wants_arm64_launch
 
 NEW_CONF = """NAME="{name}"
+BROWSER="{browser}"
 LANGUAGE="{language}"
 LOCALE="{locale}"
 TIMEZONE="{timezone}"
@@ -38,20 +41,22 @@ TEMPORARY="false"
 
 def _resolve_timezone(identity: Identity) -> tz.Resolution:
     """Resolve the timezone, refusing to silently fall back to the host one."""
-    resolution = tz.resolve(identity.timezone)
+    browser = get_browser(identity.browser)
+    resolution = tz.resolve(identity.timezone, browser.engine)
     if not resolution.supported and identity.timezone_fallback != "host":
-        raise MifError(tz.unsupported_message(identity.name, resolution))
+        raise MifError(
+            tz.unsupported_message(identity.name, resolution, browser.engine)
+        )
     return resolution
 
 
 def _prepare(identity: Identity) -> tz.Resolution:
     resolution = _resolve_timezone(identity)
-    prefs.write(identity, resolution)
+    get_browser(identity.browser).prepare(identity, resolution)
     return resolution
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    firefox_binary()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     APPS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +66,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     failures: list[str] = []
     for identity in identities:
+        browser = get_browser(identity.browser)
         try:
+            browser.locate()
             resolution = _prepare(identity)
         except MifError as error:
             failures.append(str(error))
@@ -74,6 +81,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         elif not resolution.supported:
             note = "  (host timezone, TIMEZONE_FALLBACK=host)"
         print(f"Prepared {identity.name} -> {identity.profile_dir}{note}")
+        for notice in browser.notices(identity):
+            print(f"  {notice.kind}: {notice.message}")
 
     if failures:
         print("", file=sys.stderr)
@@ -83,8 +92,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print()
     print(f"Launchers are in: {APPS_DIR}")
     print("Timezone, locale and geolocation are applied from the identity configs.")
-    print("No companion extensions are needed; remove any Spoof Timezone / Spoof")
-    print("Geolocation add-ons left over from earlier versions.")
+    print("Firefox profiles do not need companion extensions; remove any Spoof")
+    print("Timezone / Spoof Geolocation add-ons left over from earlier versions.")
 
     return 1 if failures else 0
 
@@ -95,40 +104,51 @@ def cmd_status(args: argparse.Namespace) -> int:
         raise MifError(f"No identities found in {IDENTITIES_DIR}")
 
     print(f"Platform: {sys.platform}")
-    try:
-        print(f"Firefox:  {firefox_binary()}")
-    except MifError as error:
-        print(f"Firefox:  NOT FOUND ({error.args[0].splitlines()[0]})")
+    seen: list[str] = []
+    for identity in identities:
+        if identity.browser not in seen:
+            seen.append(identity.browser)
+    for key in seen:
+        browser = get_browser(key)
+        try:
+            print(f"{browser.display_name}: {browser.locate()}")
+        except MifError as error:
+            print(f"{browser.display_name}: NOT FOUND ({error.args[0].splitlines()[0]})")
     print()
 
     width = max(len(i.name) for i in identities)
     for identity in identities:
-        resolution = tz.resolve(identity.timezone)
+        browser = get_browser(identity.browser)
+        resolution = tz.resolve(identity.timezone, browser.engine)
         if resolution.supported:
             state = "ok"
         elif identity.timezone_fallback == "host":
             state = "host timezone (acknowledged)"
         else:
             state = "REFUSED - see mif setup"
-        geo = (
-            f"{identity.geo_lat},{identity.geo_lon}"
-            if identity.geo_lat
-            else "not pinned"
-        )
         proxy = (
             f"{identity.proxy_type}://{identity.proxy_host}:{identity.proxy_port}"
             if identity.proxy_type != "none"
             else "direct"
         )
-        print(f"{identity.name:<{width}}  tz={resolution.summary}  [{state}]")
-        print(f"{'':<{width}}  proxy={proxy}  geo={geo}")
+        print(
+            f"{identity.name:<{width}}  browser={browser.display_name}"
+            f"  tz={resolution.summary}  [{state}]"
+        )
+        print(
+            f"{'':<{width}}  proxy={proxy}  geo={browser.geo_summary(identity)}"
+            f"  fingerprint={browser.fingerprint_summary(identity)}"
+        )
+        for notice in browser.notices(identity):
+            print(f"{'':<{width}}  {notice.kind}: {notice.message}")
     return 0
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
     identity = load_identity(args.identity)
+    browser = get_browser(identity.browser)
     resolution = _prepare(identity)
-    binary = firefox_binary()
+    binary = browser.locate()
 
     env = dict(os.environ)
     if resolution.value:
@@ -139,13 +159,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
     command: list[str] = []
     if wants_arm64_launch(binary):
         command += ["/usr/bin/arch", "-arm64"]
-    command.append(str(binary))
-    command.append("-no-remote")
-    if not is_windows():
-        # -new-instance is Unix-only; passing it on Windows is not supported.
-        command.append("-new-instance")
-    command += ["-profile", str(identity.profile_dir)]
-    command += args.args
+    command += browser.command(identity, binary, args.args)
 
     if is_windows():
         subprocess.Popen(command, env=env, close_fds=True)
@@ -162,6 +176,7 @@ def cmd_new_identity(args: argparse.Namespace) -> int:
     conf.write_text(
         NEW_CONF.format(
             name=name,
+            browser=args.browser,
             language=args.language,
             locale=args.locale,
             timezone=args.timezone,
@@ -199,8 +214,11 @@ def cmd_install(args: argparse.Namespace) -> int:
     if not sources:
         raise MifError(f"No launchers found in {APPS_DIR}; run setup first.")
 
+    identity_names = {identity.name for identity in all_identities()}
+    source_names = {source.name for source in sources}
     for destination in destinations:
         destination.mkdir(parents=True, exist_ok=True)
+        launchers.prune_installed(destination, source_names, identity_names)
         for source in sources:
             target = destination / source.name
             if target.is_dir():
@@ -217,7 +235,7 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mif", description="Multi-identity Firefox launcher."
+        prog="mif", description="Multi-identity browser launcher."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -229,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     launch = sub.add_parser("launch", help="Launch one identity")
     launch.add_argument("identity")
-    launch.add_argument("args", nargs=argparse.REMAINDER, help="Extra Firefox args")
+    launch.add_argument("args", nargs=argparse.REMAINDER, help="Extra browser arguments")
     launch.set_defaults(func=cmd_launch)
 
     new = sub.add_parser("new-identity", help="Create a new identity config")
@@ -242,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("proxy_type", nargs="?", default="none")
     new.add_argument("proxy_host", nargs="?", default="")
     new.add_argument("proxy_port", nargs="?", default="")
+    new.add_argument("--browser", default="firefox", choices=list(BROWSER_KEYS))
     new.add_argument("--force", action="store_true")
     new.set_defaults(func=cmd_new_identity)
 

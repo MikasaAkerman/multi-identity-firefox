@@ -1,14 +1,32 @@
-"""Rendering a profile's user.js from its identity config."""
+"""Firefox backend.
+
+Profile state lives in ``user.js``, regenerated on every launch so the conf
+always wins over ``about:config``. The web-visible timezone is not a pref:
+the launcher exports ``TZ`` and Firefox reads it through ICU.
+"""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from .config import TEMPLATES_DIR, Identity
-from .ffpath import is_windows
-from .tz import Resolution
+from ..binpath import BinarySpec, is_windows, locate_binary
+from ..config import TEMPLATES_DIR, Identity
+from ..tz import Resolution
+from .base import Notice
 
 TEMPLATE = TEMPLATES_DIR / "user.js.tpl"
+
+FIREFOX_SPEC = BinarySpec(
+    key="firefox",
+    display_name="Firefox",
+    env_vars=("MIF_FIREFOX_BIN", "FIREFOX_BIN"),
+    macos_bundles=(("Firefox.app", "firefox"),),
+    windows_app_paths=(),
+    windows_subpaths=("Mozilla Firefox/firefox.exe",),
+    path_names=("firefox",),
+    use_firefox_registry=True,
+)
 
 
 def pref_string(value: str) -> str:
@@ -157,3 +175,39 @@ def render(identity: Identity, resolution: Resolution) -> str:
 def write(identity: Identity, resolution: Resolution) -> None:
     identity.ensure_dirs()
     (identity.profile_dir / "user.js").write_text(render(identity, resolution))
+
+
+class GeckoBrowser:
+    key = "firefox"
+    display_name = "Firefox"
+    engine = "gecko"
+
+    def locate(self) -> Path:
+        return locate_binary(FIREFOX_SPEC)
+
+    def prepare(self, identity: Identity, resolution: Resolution) -> None:
+        write(identity, resolution)
+
+    def command(
+        self, identity: Identity, binary: Path, extra_args: list[str]
+    ) -> list[str]:
+        command = [str(binary), "-no-remote"]
+        if not is_windows():
+            # -new-instance is Unix-only; passing it on Windows is not supported.
+            command.append("-new-instance")
+        command += ["-profile", str(identity.profile_dir)]
+        command += extra_args
+        return command
+
+    def notices(self, identity: Identity) -> list[Notice]:
+        return []
+
+    def geo_summary(self, identity: Identity) -> str:
+        if identity.geo_lat:
+            return f"{identity.geo_lat},{identity.geo_lon}"
+        return "not pinned"
+
+    def fingerprint_summary(self, identity: Identity) -> str:
+        if identity.fingerprint_protection:
+            return "on"
+        return "off"
